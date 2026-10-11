@@ -1,13 +1,13 @@
 # 스미싱 예방 교육 및 탐지 시스템 API 명세서
 
-- **버전:** Draft v0.1 / API v1
+- **버전:** Draft v0.2 / API v1
 - **상태:** 팀 검토용 구현 계약 초안
 - **관련 문서:** [기능 명세](01_Feature_Specification.md), [사용자 흐름](02_User_Flow.md), [아키텍처](03_System_Architecture.md)
 - **범위:** 비회원 URL·문자·QR 분석 및 서버 상태 확인
 
 ## 1. 범위와 계약 원칙
 
-교육·퀴즈는 FE 정적 콘텐츠로 제공하므로 별도 API를 만들지 않는다. 회원, 검사 이력, 관리자, OCR API는 MVP 범위 밖이다.
+교육·퀴즈는 OCI Docker PostgreSQL에 저장하고 BE API로 조회·채점한다. 데이터 모델은 `04_Database_Design.md`를 따른다. 회원, 검사 이력, 관리자, OCR API는 MVP 범위 밖이다.
 
 본 문서의 길이 계산, URL 개수, 시간 제한 등 기존 문서에 없던 수치는 구현을 위한 제안값이다. 팀 검토 후 확정한다. 규칙별 배점과 정확도는 아직 검증되지 않았으며 점수는 악성 확률을 뜻하지 않는다.
 
@@ -16,7 +16,11 @@ API 목록:
 - `POST /api/v1/analysis/url`: URL 한 개 분석 — F-101
 - `POST /api/v1/analysis/message`: 문자와 포함 URL 분석 — F-102
 - `POST /api/v1/analysis/qr`: QR 이미지 분석 — F-103
-- `GET /api/v1/health`: 내부 분석 준비 상태 확인
+- `GET /api/v1/health`: DB를 포함한 서비스 준비 상태 확인
+- `GET /api/v1/education/cases`: 공개 교육 사례 목록
+- `GET /api/v1/education/cases/{id}`: 공개 사례와 예방수칙 상세
+- `GET /api/v1/quizzes/current`: 현재 공개된 10문제 세트
+- `POST /api/v1/quizzes/grade`: 해당 버전 답안 채점
 
 요청 하나에서 분석을 완료하는 동기 API로 구성한다. 작업 조회·폴링 API와 결과 영구 저장은 제공하지 않는다.
 
@@ -92,7 +96,7 @@ HTTP `200`의 JSON 구조는 다음과 같다. 정확한 타입은 11절에 정�
 
 `partial`은 문자 패턴 등 유효한 일부 결과가 있지만 URL 일부나 활성화된 외부 조회가 실패·생략된 경우다. FE는 결과 위에 분석 제한 경고를 표시한다.
 
-`not_applicable`은 URL이 아닌 QR 데이터에 사용한다. `risk=null`이며 점수와 안전 등급을 표시하지 않는다. 이는 기존 공통 결과 화면의 점수·등급 표시 요구에 대한 예외 제안이다.
+`not_applicable`은 URL이 아닌 QR 데이터에 사용한다. `risk=null`이며 점수와 안전 등급을 표시하지 않는다. 기능 명세와 사용자 흐름에도 동일한 예외를 반영했다.
 
 ### 4.1 위험 평가
 
@@ -234,7 +238,7 @@ HTTP 200에서 `type=qr`, `details`는 다음 형태다.
 
 `GET /api/v1/health`
 
-내부 규칙 로딩과 필수 QR 디코더 초기화가 완료됐으면 HTTP 200을 반환한다.
+내부 규칙·필수 QR 디코더 초기화와 PostgreSQL 연결·스키마 준비 확인이 모두 성공하면 HTTP 200을 반환한다.
 
 ```json
 {
@@ -246,7 +250,7 @@ HTTP 200에서 `type=qr`, `details`는 다음 형태다.
 }
 ```
 
-준비되지 않았으면 `503 SERVICE_UNAVAILABLE`을 반환한다. 외부 평판 API 장애는 필수 내부 기능의 준비 상태에 영향을 주지 않는다. 비밀 설정·서버 경로·원문 데이터는 공개하지 않는다.
+준비되지 않았으면 `503 SERVICE_UNAVAILABLE`을 반환한다. DB 장애로 health가 실패해도 규칙 로딩이 끝난 분석 API는 계속 동작할 수 있다. 이 readiness 결과만으로 프로세스를 반복 재시작하지 않는다. 외부 평판 API 장애는 필수 내부 기능의 준비 상태에 영향을 주지 않는다. 비밀 설정·서버 경로·원문 데이터는 공개하지 않는다.
 
 ## 9. 오류와 부분 결과
 
@@ -264,11 +268,13 @@ HTTP 200에서 `type=qr`, `details`는 다음 형태다.
 }
 ```
 
-`field`는 `url`, `message`, `file` 또는 `null`이다. `retryable=true`는 같은 입력으로 나중에 다시 요청할 수 있다는 의미다. FE 자동 재시도를 지시하지 않는다.
+`field`는 `url`, `message`, `file`, `answers`, `quiz_version`, `id`, `page`, `page_size`, `category` 또는 `null`이다. `retryable=true`는 같은 입력으로 나중에 다시 요청할 수 있다는 의미다. FE 자동 재시도를 지시하지 않는다.
 
 오류 목록:
 
 - 400 `INVALID_JSON`: JSON 문법 오류. 재시도 불가.
+- 404 `CONTENT_NOT_FOUND`: 없는/비공개 사례 또는 현재 문제 세트 없음. 재시도 불가.
+- 409 `QUIZ_VERSION_UNAVAILABLE`: 채점할 버전이 폐기됨. 새 문제 조회 필요.
 - 413 `PAYLOAD_TOO_LARGE`: 파일 또는 요청 크기 초과. 재시도 불가.
 - 415 `UNSUPPORTED_MEDIA_TYPE`: 요청 Content-Type 또는 지원하지 않는 실제 이미지 형식. 재시도 불가.
 - 422 `VALIDATION_ERROR`: 누락·빈 값·타입·길이·추가 필드·복수 파일 오류. 재시도 불가.
@@ -387,13 +393,118 @@ type ErrorResponse = {
   error: {
     code: string;
     message: string;
-    field: 'url' | 'message' | 'file' | null;
+    field: 'url' | 'message' | 'file' | 'answers' | 'quiz_version' | 'id'
+      | 'page' | 'page_size' | 'category' | null;
     retryable: boolean;
   };
 };
 ```
 
-## 12. 계약 검증과 후속 결정
+## 12. DB 기반 교육·퀴즈 API
+
+모든 응답은 request_id와 data 또는 error의 공통 envelope를 따른다. 아래 JSON은 data 내부 예시다. 조회·채점의 BE 제한은 5초, FE 제한은 10초를 초기값으로 제안한다. DB 연결·쿼리 실패는 503 SERVICE_UNAVAILABLE로 처리한다.
+
+### 12.1 교육 목록
+
+GET /api/v1/education/cases
+
+쿼리: page(기본 1, 1 이상), page_size(기본 10, 1~50), category(선택). category enum은 DB 설계의 7개 코드와 같다. 잘못된 쿼리는 422다. 공개 행만 sort_order, id 순으로 제공한다. 범위를 벗어난 페이지는 빈 items다.
+
+```json
+{
+  "items": [
+    {
+      "id": "c9025880-06a2-4b27-8f51-001d0e470aff",
+      "category": "delivery",
+      "title": "택배 사칭 사례",
+      "summary": "배송 안내를 가장한 링크를 확인하는 방법"
+    }
+  ],
+  "page": 1,
+  "page_size": 10,
+  "total": 1
+}
+```
+
+### 12.2 교육 상세
+
+GET /api/v1/education/cases/{id}
+
+id는 UUID다. 문법 오류 422, 없는/비공개 사례 404. 목록의 네 필드에 example_message(string), suspicious_points(string[]), damage_process(string[]), prevention(string[]), response_steps(string[])를 추가해 반환한다. 예방수칙은 이 상세 응답에 포함한다.
+
+### 12.3 현재 퀴즈
+
+GET /api/v1/quizzes/current
+
+```json
+{
+  "quiz_version": "quiz-v1",
+  "title": "스미싱 예방 퀴즈",
+  "questions": [
+    {
+      "id": "d397e264-8956-4981-94fd-f7dfb3028326",
+      "position": 1,
+      "kind": "ox",
+      "prompt": "의심 링크는 공식 경로로 먼저 확인해야 한다.",
+      "options": [
+        { "id": "7304b273-46c4-4b35-9e93-34d08c3536b6", "label": "O" },
+        { "id": "006bfdb5-3660-4432-8bdb-ff0b25c2be07", "label": "X" }
+      ]
+    }
+  ]
+}
+```
+
+위 예시는 한 문제만 발췌했다. 실제 questions는 position 순서로 정확히 10개며 options도 position 순이다. kind는 ox 또는 multiple_choice다. 정답·해설은 포함하지 않는다. 현재 공개 세트가 없으면 404 CONTENT_NOT_FOUND다.
+
+### 12.4 퀴즈 채점
+
+POST /api/v1/quizzes/grade — application/json
+
+요청 형식(답안 1개 발췌):
+
+```json
+{
+  "quiz_version": "quiz-v1",
+  "answers": [
+    {
+      "question_id": "d397e264-8956-4981-94fd-f7dfb3028326",
+      "option_id": "7304b273-46c4-4b35-9e93-34d08c3536b6"
+    }
+  ]
+}
+```
+
+실제 요청은 해당 버전의 10문제마다 답안 하나씩 정확히 포함한다. 누락·중복·다른 세트의 문제·해당 문제에 속하지 않는 선택지는 422 VALIDATION_ERROR다. quiz_version은 1~64자다. 없는/폐기된 버전은 409 QUIZ_VERSION_UNAVAILABLE다. 이전 공개 버전은 보존된 동안 동일하게 채점한다.
+
+응답 형식(결과 1개 발췌):
+
+```json
+{
+  "quiz_version": "quiz-v1",
+  "total_count": 10,
+  "correct_count": 10,
+  "score": 100,
+  "results": [
+    {
+      "question_id": "d397e264-8956-4981-94fd-f7dfb3028326",
+      "selected_option_id": "7304b273-46c4-4b35-9e93-34d08c3536b6",
+      "correct_option_id": "7304b273-46c4-4b35-9e93-34d08c3536b6",
+      "is_correct": true,
+      "explanation": "문자 속 링크 대신 공식 경로로 확인합니다.",
+      "related_case_id": "c9025880-06a2-4b27-8f51-001d0e470aff"
+    }
+  ]
+}
+```
+
+실제 results는 문제 순서대로 10개다. 한 문제당 10점이며 related_case_id는 공개 사례가 없으면 null이다. 점수는 BE가 계산한다. 답안·점수는 저장하지 않고 응답에만 사용한다. 동일 버전과 답안의 재제출은 동일 결과를 반환한다.
+
+교육·퀴즈 응답도 no-store를 적용한다. GET 교육·퀴즈와 채점 API를 합해 IP별 60초 고정 구간 60회 제한을 초기안으로 둔다. 429는 기존 공통 규격을 따른다.
+
+추가 계약 테스트: 목록 페이지·유형 필터, 비공개 사례 404, 조회 응답 정답 미포함, 10문제 검증, 중복 답안 거부, 이전 버전 채점, DB 장애 503, 제출 기록 미저장.
+
+## 13. 계약 검증과 후속 결정
 
 FE 목 데이터와 BE 테스트는 동일한 fixture를 사용하도록 후속 작업으로 구성한다. 최소 검증 항목은 다음과 같다.
 
@@ -411,7 +522,7 @@ FE 목 데이터와 BE 테스트는 동일한 fixture를 사용하도록 후속 
 
 - 신규 제안값: URL 2,048자, 문자 URL 최대 5개, 15/30초 제한, 요청 제한.
 - 문자 점수의 최댓값 집계와 규칙별 배점 검증.
-- 비URL QR의 `risk=null` 예외를 기능 명세 및 사용자 흐름에 반영.
+- 비URL QR의 `risk=null` 예외 및 DB 콘텐츠·채점 계약의 통합 테스트.
 - 배포 서버 주소와 실제 프록시 제한 설정.
 - 외부 제공자 확정 전까지 평판 조회 기본 비활성화.
 
